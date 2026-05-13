@@ -1,0 +1,337 @@
+import cv2
+import torch
+import numpy as np
+import open_clip
+
+from ultralytics import YOLO
+from PIL import Image
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+YOLO_MODEL = "yolov8n.pt"
+
+CLIP_MODEL = "ViT-B-32"
+CLIP_PRETRAINED = "openai"
+
+VIDEO_SOURCE = 0
+
+PERSON_CLASS_ID = 0
+
+SIMILARITY_THRESHOLD = 0.70
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+detector = YOLO(YOLO_MODEL)
+
+# ============================================================
+# LOAD CLIP
+# ============================================================
+
+clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+    CLIP_MODEL,
+    pretrained=CLIP_PRETRAINED,
+    device=device
+)
+
+clip_model.eval()
+
+# ============================================================
+# GLOBAL IDENTITY GALLERY
+# Stores:
+# ID -> CLIP embedding
+# ============================================================
+
+identity_gallery = {}
+
+# ============================================================
+# RANDOM COLORS
+# ============================================================
+
+rng = np.random.default_rng(42)
+
+colours = rng.integers(
+    50,
+    230,
+    (1000, 3)
+).tolist()
+
+# ============================================================
+# CREATE CLIP EMBEDDINGS
+# ============================================================
+
+def get_clip_embeddings(frame, boxes):
+
+    if len(boxes) == 0:
+        return np.empty((0, 512), dtype=np.float32)
+
+    crops = []
+
+    for box in boxes:
+
+        x1, y1, x2, y2 = box
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            crop = np.zeros((10, 10, 3), dtype=np.uint8)
+
+        crop = cv2.cvtColor(
+            crop,
+            cv2.COLOR_BGR2RGB
+        )
+
+        pil_image = Image.fromarray(crop)
+
+        processed = clip_preprocess(pil_image)
+
+        crops.append(processed)
+
+    batch = torch.stack(crops).to(device)
+
+    with torch.no_grad():
+
+        features = clip_model.encode_image(batch)
+
+        features = features / features.norm(
+            dim=-1,
+            keepdim=True
+        )
+
+    return features.cpu().numpy().astype(np.float32)
+
+def find_matching_identity(
+    embedding,
+    gallery,
+    threshold=SIMILARITY_THRESHOLD
+):
+
+    best_similarity = -1
+    best_id = None
+
+    for identity_id, stored_embedding in gallery.items():
+
+        similarity = np.dot(
+            embedding,
+            stored_embedding
+        )
+
+        if similarity > best_similarity:
+
+            best_similarity = similarity
+            best_id = identity_id
+
+    if best_similarity >= threshold:
+        return best_id, best_similarity
+
+    return None, best_similarity
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    cap = cv2.VideoCapture(VIDEO_SOURCE)
+
+    while True:
+
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        # ====================================================
+        # YOLO + BYTETRACK
+        # ====================================================
+
+        results = detector.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False
+        )[0]
+
+        # No detections
+        if results.boxes.id is None:
+
+            cv2.imshow(
+                "CLIP Re-Identification",
+                frame
+            )
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+            continue
+
+        # ====================================================
+        # EXTRACT DETECTIONS
+        # ====================================================
+
+        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+
+        class_ids = results.boxes.cls.cpu().numpy().astype(int)
+
+        track_ids = results.boxes.id.cpu().numpy().astype(int)
+
+        # ====================================================
+        # FILTER ONLY PERSONS
+        # ====================================================
+
+        filtered_boxes = []
+        filtered_track_ids = []
+
+        for box, cls_id, tid in zip(
+            boxes,
+            class_ids,
+            track_ids
+        ):
+
+            if cls_id == PERSON_CLASS_ID:
+
+                filtered_boxes.append(box.tolist())
+
+                filtered_track_ids.append(tid)
+
+        # ====================================================
+        # GENERATE CLIP EMBEDDINGS
+        # ====================================================
+
+        embeddings = get_clip_embeddings(
+            frame,
+            filtered_boxes
+        )
+
+        # ====================================================
+        # RE-IDENTIFICATION
+        # ====================================================
+
+        resolved_ids = []
+
+        for i, bytetrack_id in enumerate(filtered_track_ids):
+
+            current_embedding = embeddings[i]
+
+            matched_id, similarity = find_matching_identity(
+                current_embedding,
+                identity_gallery,
+                threshold=SIMILARITY_THRESHOLD
+            )
+
+            # =================================================
+            # OLD PERSON FOUND
+            # =================================================
+
+            if matched_id is not None:
+
+                resolved_id = matched_id
+
+                old_embedding = identity_gallery[resolved_id]
+
+                updated_embedding = (
+                    0.9 * old_embedding +
+                    0.1 * current_embedding
+                )
+
+                updated_embedding /= np.linalg.norm(
+                    updated_embedding
+                )
+
+                identity_gallery[resolved_id] = updated_embedding
+
+            # =================================================
+            # NEW PERSON
+            # =================================================
+
+            else:
+
+                resolved_id = bytetrack_id
+
+                identity_gallery[resolved_id] = current_embedding
+
+            resolved_ids.append(resolved_id)
+
+        # ====================================================
+        # VISUALIZATION
+        # ====================================================
+
+        for i, box in enumerate(filtered_boxes):
+
+            x1, y1, x2, y2 = box
+
+            tid = resolved_ids[i]
+
+            colour = colours[tid % len(colours)]
+
+            # Bounding box
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                colour,
+                2
+            )
+
+            # Label
+            text = f"PERSON ID: {tid}"
+
+            (tw, th), _ = cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                2
+            )
+
+            cv2.rectangle(
+                frame,
+                (x1, y1 - th - 10),
+                (x1 + tw + 10, y1),
+                colour,
+                -1
+            )
+
+            cv2.putText(
+                frame,
+                text,
+                (x1 + 5, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+        # ====================================================
+        # SHOW FRAME
+        # ====================================================
+
+        cv2.imshow(
+            "CLIP Re-Identification",
+            frame
+        )
+
+        # Press Q to exit
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    cap.release()
+
+    cv2.destroyAllWindows()
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+    main()
