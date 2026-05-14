@@ -10,18 +10,24 @@ from PIL import Image
 # CONFIG
 # ============================================================
 
-YOLO_MODEL = "yolov8n.pt"
-
-CLIP_MODEL = "ViT-B-32"
+YOLO_MODEL      = "yolov8n.pt"
+CLIP_MODEL      = "ViT-B-32"
 CLIP_PRETRAINED = "openai"
-
-VIDEO_SOURCE = 0
-
+VIDEO_SOURCE    = 0
 PERSON_CLASS_ID = 0
 
-SIMILARITY_THRESHOLD = 0.70
+# Two-threshold system:
+#   STRICT_THRESHOLD  — confident same person  → reuse ID
+#   SOFT_THRESHOLD    — probably same person   → soft-match (don't mint new ID)
+#   below SOFT        — genuinely new person   → mint new ID
+STRICT_THRESHOLD = 0.83
+SOFT_THRESHOLD   = 0.75
+
+# Frames of absence before a gallery entry is deleted
+MAX_MISSED_FRAMES = 240   # ~2 sec at 30fps
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
 detector = YOLO(YOLO_MODEL)
 
@@ -34,304 +40,243 @@ clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
     pretrained=CLIP_PRETRAINED,
     device=device
 )
-
 clip_model.eval()
 
 # ============================================================
-# GLOBAL IDENTITY GALLERY
-# Stores:
-# ID -> CLIP embedding
+# GALLERY
+# gallery[clip_id] = {
+#     "embedding": np.ndarray (512,),
+#     "missed":    int          <- frames since last matched
+# }
 # ============================================================
 
-identity_gallery = {}
+gallery      = {}
+next_clip_id = 1   # our own counter — never reuses IDs (unlike ByteTrack)
+
+rng     = np.random.default_rng(42)
+colours = rng.integers(50, 230, (1000, 3)).tolist()
 
 # ============================================================
-# RANDOM COLORS
-# ============================================================
-
-rng = np.random.default_rng(42)
-
-colours = rng.integers(
-    50,
-    230,
-    (1000, 3)
-).tolist()
-
-# ============================================================
-# CREATE CLIP EMBEDDINGS
+# CLIP EMBEDDINGS  (your original function — unchanged)
 # ============================================================
 
 def get_clip_embeddings(frame, boxes):
-
     if len(boxes) == 0:
         return np.empty((0, 512), dtype=np.float32)
 
     crops = []
-
     for box in boxes:
-
         x1, y1, x2, y2 = box
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-
-        x2 = min(frame.shape[1], x2)
-        y2 = min(frame.shape[0], y2)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
         crop = frame[y1:y2, x1:x2]
-
         if crop.size == 0:
             crop = np.zeros((10, 10, 3), dtype=np.uint8)
 
-        crop = cv2.cvtColor(
-            crop,
-            cv2.COLOR_BGR2RGB
-        )
-
-        pil_image = Image.fromarray(crop)
-
-        processed = clip_preprocess(pil_image)
-
-        crops.append(processed)
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crops.append(clip_preprocess(Image.fromarray(crop)))
 
     batch = torch.stack(crops).to(device)
-
     with torch.no_grad():
-
         features = clip_model.encode_image(batch)
-
-        features = features / features.norm(
-            dim=-1,
-            keepdim=True
-        )
+        features = features / features.norm(dim=-1, keepdim=True)
 
     return features.cpu().numpy().astype(np.float32)
 
-def find_matching_identity(
-    embedding,
-    gallery,
-    threshold=SIMILARITY_THRESHOLD
-):
+# ============================================================
+# RE-IDENTIFICATION  (replaces your find_matching_identity)
+#
+# What changed vs your original:
+#   1. Builds a full sim matrix → greedy exclusive matching
+#      so two people can't both claim the same gallery ID
+#   2. Two-threshold system — "zone B" soft match stops
+#      same person minting new IDs on slight pose changes
+#   3. Gallery cleaned every frame via missed counter
+#   4. Uses next_clip_id (our counter), NOT ByteTrack IDs
+# ============================================================
 
-    best_similarity = -1
-    best_id = None
+def resolve_ids(embeddings):
+    global next_clip_id
 
-    for identity_id, stored_embedding in gallery.items():
+    n_det        = len(embeddings)
+    assigned_ids = [None] * n_det
 
-        similarity = np.dot(
-            embedding,
-            stored_embedding
-        )
+    # ── Step 1: build similarity matrix ──────────────────────
+    gallery_ids = list(gallery.keys())
 
-        if similarity > best_similarity:
+    if gallery_ids:
+        gallery_mat = np.stack([gallery[cid]["embedding"] for cid in gallery_ids])
+        sim_matrix  = embeddings @ gallery_mat.T   # (N, M)
+    else:
+        sim_matrix = np.empty((n_det, 0))
 
-            best_similarity = similarity
-            best_id = identity_id
+    # ── Step 2: strict match (Zone C >= STRICT_THRESHOLD) ────
+    if gallery_ids:
+        work_matrix = sim_matrix.copy()
+        for _ in range(min(n_det, len(gallery_ids))):
+            best         = np.unravel_index(np.argmax(work_matrix), work_matrix.shape)
+            det_i, gal_j = best
+            score        = work_matrix[det_i, gal_j]
 
-    if best_similarity >= threshold:
-        return best_id, best_similarity
+            if score < STRICT_THRESHOLD:
+                break
 
-    return None, best_similarity
+            cid = gallery_ids[gal_j]
+            assigned_ids[det_i] = cid
+
+            old = gallery[cid]["embedding"]
+            upd = 0.9 * old + 0.1 * embeddings[det_i]
+            gallery[cid]["embedding"] = upd / np.linalg.norm(upd)
+            gallery[cid]["missed"]    = 0   # seen — reset
+
+            print(f"  [strict] det[{det_i}] → ID {cid}  sim={score:.3f}")
+
+            work_matrix[det_i, :] = -1
+            work_matrix[:, gal_j] = -1
+
+    # ── Step 3: soft match (Zone B SOFT <= sim < STRICT) ─────
+    for i in range(n_det):
+        if assigned_ids[i] is not None:
+            continue
+        if not gallery_ids:
+            continue
+
+        col_sims = sim_matrix[i]
+        best_j   = int(np.argmax(col_sims))
+        best_sim = float(col_sims[best_j])
+
+        if best_sim >= SOFT_THRESHOLD:
+            cid = gallery_ids[best_j]
+            assigned_ids[i] = cid
+
+            old = gallery[cid]["embedding"]
+            upd = 0.9 * old + 0.1 * embeddings[i]
+            gallery[cid]["embedding"] = upd / np.linalg.norm(upd)
+            gallery[cid]["missed"]    = 0   # seen — reset
+
+            print(f"  [soft]   det[{i}] → ID {cid}  sim={best_sim:.3f}")
+
+    # ── Step 4: new person ────────────────────────────────────
+    for i in range(n_det):
+        if assigned_ids[i] is None:
+            closest = float(np.max(sim_matrix[i])) if gallery_ids else 0.0
+            assigned_ids[i] = next_clip_id
+            gallery[next_clip_id] = {
+                "embedding": embeddings[i].copy(),
+                "missed":    0
+            }
+            print(f"  [new]    det[{i}] → NEW ID {next_clip_id}  closest={closest:.3f}")
+            next_clip_id += 1
+
+    # ── Step 5: age ONLY entries that were NOT matched ────────
+    # FIX: moved aging to AFTER matching so a person doesn't
+    # silently accumulate missed counts while standing in frame
+    matched_ids = set(assigned_ids)
+    for cid in list(gallery.keys()):
+        if cid not in matched_ids:
+            gallery[cid]["missed"] += 1
+            if gallery[cid]["missed"] > MAX_MISSED_FRAMES:
+                print(f"  [gallery] Removed stale ID {cid} (gone {MAX_MISSED_FRAMES} frames)")
+                del gallery[cid]
+        # matched entries already had missed=0 set above — don't touch them
+
+    return assigned_ids
 
 # ============================================================
-# MAIN
+# MAIN  (your original structure — only re-id logic swapped)
 # ============================================================
 
 def main():
-
     cap = cv2.VideoCapture(VIDEO_SOURCE)
+    print("Tracking started. Press Q to quit.\n")
 
     while True:
-
         success, frame = cap.read()
-
         if not success:
             break
 
-        # ====================================================
-        # YOLO + BYTETRACK
-        # ====================================================
-
+        # ── YOLO + ByteTrack ──────────────────────────────────
         results = detector.track(
             frame,
             persist=True,
             tracker="bytetrack.yaml",
+            device=device,
             verbose=False
         )[0]
 
-        # No detections
         if results.boxes.id is None:
-
-            cv2.imshow(
-                "CLIP Re-Identification",
-                frame
-            )
-
+            cv2.imshow("CLIP Re-Identification", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
             continue
 
-        # ====================================================
-        # EXTRACT DETECTIONS
-        # ====================================================
-
-        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
-
+        # ── Extract detections ────────────────────────────────
+        boxes     = results.boxes.xyxy.cpu().numpy().astype(int)
         class_ids = results.boxes.cls.cpu().numpy().astype(int)
-
+        # NOTE: we read ByteTrack IDs only to filter stable boxes,
+        #       we do NOT use them as identity keys anymore
         track_ids = results.boxes.id.cpu().numpy().astype(int)
 
-        # ====================================================
-        # FILTER ONLY PERSONS
-        # ====================================================
-
-        filtered_boxes = []
-        filtered_track_ids = []
-
-        for box, cls_id, tid in zip(
-            boxes,
-            class_ids,
-            track_ids
-        ):
-
+        # ── Filter persons only ───────────────────────────────
+        person_boxes = []
+        for box, cls_id, tid in zip(boxes, class_ids, track_ids):
             if cls_id == PERSON_CLASS_ID:
+                person_boxes.append(box.tolist())
 
-                filtered_boxes.append(box.tolist())
+        if not person_boxes:
+            cv2.imshow("CLIP Re-Identification", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+            continue
 
-                filtered_track_ids.append(tid)
+        # ── CLIP embeddings ───────────────────────────────────
+        embeddings = get_clip_embeddings(frame, person_boxes)
 
-        # ====================================================
-        # GENERATE CLIP EMBEDDINGS
-        # ====================================================
+        # ── Re-identify → permanent CLIP IDs ─────────────────
+        clip_ids = resolve_ids(embeddings)
 
-        embeddings = get_clip_embeddings(
-            frame,
-            filtered_boxes
-        )
-
-        # ====================================================
-        # RE-IDENTIFICATION
-        # ====================================================
-
-        resolved_ids = []
-
-        for i, bytetrack_id in enumerate(filtered_track_ids):
-
-            current_embedding = embeddings[i]
-
-            matched_id, similarity = find_matching_identity(
-                current_embedding,
-                identity_gallery,
-                threshold=SIMILARITY_THRESHOLD
-            )
-
-            # =================================================
-            # OLD PERSON FOUND
-            # =================================================
-
-            if matched_id is not None:
-
-                resolved_id = matched_id
-
-                old_embedding = identity_gallery[resolved_id]
-
-                updated_embedding = (
-                    0.9 * old_embedding +
-                    0.1 * current_embedding
-                )
-
-                updated_embedding /= np.linalg.norm(
-                    updated_embedding
-                )
-
-                identity_gallery[resolved_id] = updated_embedding
-
-            # =================================================
-            # NEW PERSON
-            # =================================================
-
-            else:
-
-                resolved_id = bytetrack_id
-
-                identity_gallery[resolved_id] = current_embedding
-
-            resolved_ids.append(resolved_id)
-
-        # ====================================================
-        # VISUALIZATION
-        # ====================================================
-
-        for i, box in enumerate(filtered_boxes):
-
+        # ── Visualise ─────────────────────────────────────────
+        for i, box in enumerate(person_boxes):
             x1, y1, x2, y2 = box
+            cid    = clip_ids[i]
+            colour = colours[cid % len(colours)]
 
-            tid = resolved_ids[i]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
 
-            colour = colours[tid % len(colours)]
+            text = f"PERSON ID: {cid}"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 10, y1), colour, -1)
+            cv2.putText(frame, text, (x1 + 5, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Bounding box
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                colour,
-                2
-            )
+        # ── Debug overlay ─────────────────────────────────────
+        # Shows live similarity of each gallery entry vs first detection
+        # Use this to tune STRICT_THRESHOLD and SOFT_THRESHOLD
+        cv2.putText(frame,
+                    f"Gallery: {len(gallery)} entries  |  next_id={next_clip_id}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # Label
-            text = f"PERSON ID: {tid}"
+        y_pos = 60
+        for cid, entry in gallery.items():
+            sim   = float(np.dot(embeddings[0], entry["embedding"]))
+            miss  = entry["missed"]
+            color = (0, 255, 0) if sim >= STRICT_THRESHOLD else \
+                    (0, 200, 255) if sim >= SOFT_THRESHOLD else \
+                    (0, 80, 255)
+            label = "STRICT" if sim >= STRICT_THRESHOLD else \
+                    "SOFT"   if sim >= SOFT_THRESHOLD   else "NEW"
+            cv2.putText(frame,
+                        f"ID {cid}: sim={sim:.3f} [{label}] missed={miss}",
+                        (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            y_pos += 20
 
-            (tw, th), _ = cv2.getTextSize(
-                text,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                2
-            )
-
-            cv2.rectangle(
-                frame,
-                (x1, y1 - th - 10),
-                (x1 + tw + 10, y1),
-                colour,
-                -1
-            )
-
-            cv2.putText(
-                frame,
-                text,
-                (x1 + 5, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-        # ====================================================
-        # SHOW FRAME
-        # ====================================================
-
-        cv2.imshow(
-            "CLIP Re-Identification",
-            frame
-        )
-
-        # Press Q to exit
+        cv2.imshow("CLIP Re-Identification", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    # ========================================================
-    # CLEANUP
-    # ========================================================
-
     cap.release()
-
     cv2.destroyAllWindows()
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     main()
