@@ -2,13 +2,8 @@ import cv2
 import torch
 import numpy as np
 import open_clip
-
 from ultralytics import YOLO
 from PIL import Image
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 YOLO_MODEL      = "yolov8n.pt"
 CLIP_MODEL      = "ViT-B-32"
@@ -16,25 +11,16 @@ CLIP_PRETRAINED = "openai"
 VIDEO_SOURCE    = 0
 PERSON_CLASS_ID = 0
 
-# Two-threshold system:
-#   STRICT_THRESHOLD  — confident same person  → reuse ID
-#   SOFT_THRESHOLD    — probably same person   → soft-match (don't mint new ID)
-#   below SOFT        — genuinely new person   → mint new ID
-STRICT_THRESHOLD = 0.83
-SOFT_THRESHOLD   = 0.75
-
-# Frames of absence before a gallery entry is deleted
-MAX_MISSED_FRAMES = 240   # ~2 sec at 30fps
+STRICT_THRESHOLD = 0.83      #confident same person
+SOFT_THRESHOLD   = 0.75      #probably same person
+MAX_MISSED_FRAMES = 240      #30fps 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 detector = YOLO(YOLO_MODEL)
 
-# ============================================================
 # LOAD CLIP
-# ============================================================
-
 clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
     CLIP_MODEL,
     pretrained=CLIP_PRETRAINED,
@@ -42,23 +28,17 @@ clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
 )
 clip_model.eval()
 
-# ============================================================
-# GALLERY
-# gallery[clip_id] = {
-#     "embedding": np.ndarray (512,),
-#     "missed":    int          <- frames since last matched
-# }
-# ============================================================
-
 gallery      = {}
-next_clip_id = 1   # our own counter — never reuses IDs (unlike ByteTrack)
+next_clip_id = 1  # our own counter — never reuses IDs (unlike ByteTrack)
 
+''' 
+gallery[clip_id] = {
+    "embedding": np.ndarray (512,),  
+    "missed":    int                  
+}
+'''
 rng     = np.random.default_rng(42)
 colours = rng.integers(50, 230, (1000, 3)).tolist()
-
-# ============================================================
-# CLIP EMBEDDINGS  (your original function — unchanged)
-# ============================================================
 
 def get_clip_embeddings(frame, boxes):
     if len(boxes) == 0:
@@ -84,17 +64,7 @@ def get_clip_embeddings(frame, boxes):
 
     return features.cpu().numpy().astype(np.float32)
 
-# ============================================================
-# RE-IDENTIFICATION  (replaces your find_matching_identity)
-#
-# What changed vs your original:
-#   1. Builds a full sim matrix → greedy exclusive matching
-#      so two people can't both claim the same gallery ID
-#   2. Two-threshold system — "zone B" soft match stops
-#      same person minting new IDs on slight pose changes
-#   3. Gallery cleaned every frame via missed counter
-#   4. Uses next_clip_id (our counter), NOT ByteTrack IDs
-# ============================================================
+# RE-IDENTIFICATION  
 
 def resolve_ids(embeddings):
     global next_clip_id
